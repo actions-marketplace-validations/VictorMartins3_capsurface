@@ -53,6 +53,57 @@ test('review exposes matching, file/line evidence, coverage and the same gate ou
   assert.equal(JSON.parse(check.stdout).escalations.find((entry) => entry.name === 'p').id, p.id);
 });
 
+test('explain reads one saved review entry without revalidating or changing approval inputs', () => {
+  const f = fixture();
+  const report = f.review();
+  const entry = report.entries.find((item) => item.name === 'p');
+  const file = path.join(f.tmp, 'review.json');
+  f.save(file, report);
+  const original = fs.readFileSync(file, 'utf8');
+  // The saved report remains readable even when its original inputs are gone.
+  fs.unlinkSync(f.baseline);
+  fs.rmSync(f.out, { recursive: true });
+  const args = ['explain', '--report', file, '--id', entry.id, '--json'];
+  const result = runCli(args);
+  assert.equal(result.status, 0, result.stderr);
+  const explanation = JSON.parse(result.stdout);
+  assert.deepEqual(explanation.entry, entry);
+  assert.equal(explanation.source.freshness, 'not-checked');
+  assert.equal(explanation.idKind, 'review-content-id');
+  assert.equal(explanation.report.wouldFail, true, 'a successful lookup is not a passing gate');
+  assert.deepEqual(explanation.audit, report.audit.installations.find((item) => item.name === 'p'));
+  const output = path.join(f.tmp, 'details/entry.json');
+  const saved = runCli([...args, '--out', output]);
+  assert.equal(saved.status, 0, saved.stderr);
+  assert.equal(saved.stdout, '');
+  assert.deepEqual(JSON.parse(fs.readFileSync(output)), explanation);
+  assert.equal(runCli([...args, '--out', file]).status, 2);
+  assert.equal(fs.readFileSync(file, 'utf8'), original);
+});
+
+test('explain rejects missing, ambiguous and malformed IDs or reports', () => {
+  const f = fixture();
+  const report = f.review(), id = report.entries[0].id;
+  const file = path.join(f.tmp, 'review.json');
+  const args = ['explain', '--report', file, '--id', id];
+  f.save(file, report);
+  assert.equal(runCli([...args, '--unknown']).status, 2);
+  assert.equal(runCli(['explain', '--report', file, '--id', id.slice(0, 8)]).status, 2);
+  assert.equal(runCli(['explain', '--report', file, '--id', '0'.repeat(32)]).status, 2);
+  for (const invalid of [null, { ...report, schemaVersion: 99 }, { runs: [] },
+    { ...report, entries: [report.entries[0], report.entries[0]] },
+    { ...report, entries: [{ ...report.entries[0], evidence: null }] }]) {
+    f.save(file, invalid);
+    const result = runCli(args);
+    assert.equal(result.status, 2);
+    assert.equal(result.stdout, '');
+  }
+  fs.writeFileSync(file, '{');
+  assert.equal(runCli(args).status, 2);
+  fs.unlinkSync(file);
+  assert.equal(runCli(args).status, 2);
+});
+
 test('approve changes only the selected installation and records the reason', () => {
   const f = fixture();
   const p = f.review().entries.find((entry) => entry.name === 'p');
@@ -179,7 +230,7 @@ test('Markdown output is written even when review returns a failing status', () 
   assert.equal(result.status, 1);
   const text = fs.readFileSync(output, 'utf8');
   assert.match(text, /Review ID:/);
-  assert.match(text, /Source evidence:/);
+  assert.match(text, /Source evidence before and after:/);
   assert.match(text, /index\\\.js:1/);
   assert.equal(runCli(['review', f.out, '--baseline', f.baseline, '--out', output, '--report-only']).status, 0);
 });
@@ -212,4 +263,49 @@ test('review flags an old engine even when both manifests were produced by it', 
   assert.equal(report.entries.length, 1);
   assert.equal(report.entries[0].rulesChanged, true);
   assert.equal(report.entries[0].approvable, false);
+});
+
+test('review preserves removed evidence and keeps ambiguous predecessors separate', () => {
+  const f = fixture();
+  const before = f.manifest('old', '1', "require('https');", 'old');
+  const other = f.manifest('old', '2', "require('child_process');", 'nested/old');
+  const after = f.manifest('old', '3', 'module.exports = 1;', 'old');
+  let report = buildReview(new Map([['old', [before]]]), new Map([['old', [after]]])).report;
+  assert.ok(report.entries[0].changes.some((c) => c.type === 'capability-removed'));
+  assert.ok(report.entries[0].baselineEvidence[0].evidence.some((e) => e.snippet.includes('https')));
+  assert.equal(report.entries[0].evidence.length, 0);
+  assert.match(renderMarkdown(report), /Before: 1 at old/);
+  assert.match(renderMarkdown(report), /does not establish that the behavior was removed/);
+  before.coverage.complete = false;
+  before.capabilities.network.evidence[0].snippet = '<script>alert(1)</script>';
+  after.installPath = 'another/old';
+  report = buildReview(new Map([['old', [before, other]]]), new Map([['old', [after]]])).report;
+  assert.equal(report.entries[0].match.kind, 'ambiguous');
+  assert.deepEqual(report.entries[0].baselineEvidence.map((b) => b.version), ['1', '2']);
+  const md = renderMarkdown(report);
+  assert.match(md, /Before \(candidate\): 1/);
+  assert.match(md, /Before \(candidate\): 2/);
+  assert.match(md, /Baseline analysis is incomplete/);
+  assert.ok(!md.includes('<script>'));
+  assert.ok(md.includes('&lt;script&gt;'));
+});
+
+test('write-file-atomic historical snapshots report newly detected operations without claiming new behavior', () => {
+  const root = path.join(__dirname, '../docs/field-reviews/results/write-file-atomic');
+  function snapshot(folder) {
+    return JSON.parse(fs.readFileSync(path.join(root, folder, fs.readdirSync(path.join(root, folder)).find((file) => file.endsWith('.json'))), 'utf8'));
+  }
+  const before = snapshot('basic-before');
+  const after = snapshot('basic-after');
+  const report = buildReview(new Map([[before.name, [before]]]), new Map([[after.name, [after]]])).report;
+  const entry = report.entries[0];
+  assert.ok(entry.changes.some((c) => c.category === 'filesystemWrite' && c.type === 'capability-added'));
+  assert.equal(entry.baselineEvidence[0].version, '2.4.3');
+  assert.ok(entry.evidence.some((e) => e.category === 'filesystemWrite'));
+  const md = renderMarkdown(report);
+  assert.match(md, /does not establish when the behavior began/);
+  assert.ok(!md.includes('was not present'));
+  assert.match(md, /Before: 2/);
+  assert.match(md, /After: 3/);
+  assert.equal(report.wouldFail, true);
 });

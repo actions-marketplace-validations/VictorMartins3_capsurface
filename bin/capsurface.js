@@ -82,11 +82,12 @@ function cmdScan(args) {
 function cmdScanLock(args) {
   const { positional, flags } = parseFlags(args);
   if (positional.length !== 1 || typeof flags.tarballs !== 'string' || typeof flags.out !== 'string') {
-    die('usage: capsurface scan-lock <package-lock.json> --tarballs <map.json> --out <manifests-dir> [--deep]');
+    die('usage: capsurface scan-lock <package-lock.json|pnpm-lock.yaml> --tarballs <map.json> --out <manifests-dir> [--deep]');
   }
   const result = require('../lib/lockfile-scan').scanLockfile(positional[0], flags.tarballs, flags.out, { deep: flags.deep });
   console.log(`Scanned ${result.count} locked tarball(s) without installing packages or running scripts.`);
   console.log(`Manifests written to ${flags.out}/`);
+  if (result.scope) console.log('Scope: registry tarballs only. Project and linked workspace source files were not scanned.');
   if (result.incomplete) { console.error(`${result.incomplete} package(s) have incomplete analysis.`); process.exitCode = 2; }
 }
 
@@ -524,7 +525,8 @@ function cmdReview(args) {
   if (flags.lockfile !== undefined && typeof flags.lockfile !== 'string') die('--lockfile requires a filename');
   if (flags['project-root'] !== undefined && typeof flags['project-root'] !== 'string') die('--project-root requires a directory');
   const provenance = flags.lockfile ? loadProvenance(flags.lockfile, flags['project-root']) : undefined;
-  const { report } = buildReview(loadBaseline(readJson(baselineFile)), loadManifestsFromDir(positional[0]), flags['fail-on-new'] === true, provenance);
+  const lock = readJson(baselineFile);
+  const { report } = buildReview(loadBaseline(lock), loadManifestsFromDir(positional[0]), flags['fail-on-new'] === true, provenance, lock.approvals);
   report.baseline = baselineFile;
   report.reportOnly = flags['report-only'] === true;
   const text = format === 'markdown' ? renderMarkdown(report) : JSON.stringify(format === 'sarif' ? renderSarif(report) : report, null, 2) + '\n';
@@ -536,6 +538,28 @@ function cmdReview(args) {
     process.stdout.write(text);
   }
   if (report.wouldFail && !report.reportOnly) process.exitCode = 1;
+}
+
+function cmdExplain(args) {
+  const { positional, flags } = parseFlags(args);
+  if (positional.length || Object.keys(flags).some((key) => !['report', 'id', 'json', 'out'].includes(key)) ||
+      typeof flags.report !== 'string' || !flags.report || typeof flags.id !== 'string' ||
+      (flags.json !== undefined && flags.json !== true) ||
+      (flags.out !== undefined && (typeof flags.out !== 'string' || !flags.out))) {
+    die('usage: capsurface explain --report <review.json> --id <review-id> [--json] [--out <file>]');
+  }
+  const { readBounded } = require('../lib/tarball');
+  const { explainReview } = require('../lib/explain');
+  const result = explainReview(JSON.parse(readBounded(flags.report, 64 * 1024 * 1024)), flags.id);
+  const text = JSON.stringify(result, null, 2) + '\n';
+  if (flags.out) {
+    if (fs.existsSync(flags.out)) {
+      const source = fs.statSync(flags.report), target = fs.statSync(flags.out);
+      if (source.dev === target.dev && source.ino === target.ino) die('--out must not overwrite the source report');
+    }
+    fs.mkdirSync(path.dirname(flags.out), { recursive: true });
+    fs.writeFileSync(flags.out, text);
+  } else process.stdout.write(text);
 }
 
 function cmdApprove(args) {
@@ -573,6 +597,8 @@ function main() {
       return cmdCheck(rest);
     case 'review':
       return cmdReview(rest);
+    case 'explain':
+      return cmdExplain(rest);
     case 'approve':
       return cmdApprove(rest);
     case 'diff':
@@ -585,11 +611,12 @@ function main() {
 Usage:
   capsurface scan <package-dir> [--out manifest.json] [--deep]
   capsurface scan-tree <node_modules-dir> --out <manifests-dir> [--deep]
-  capsurface scan-lock <package-lock.json> --tarballs <map.json> --out <manifests-dir> [--deep]
+  capsurface scan-lock <package-lock.json|pnpm-lock.yaml> --tarballs <map.json> --out <manifests-dir> [--deep]
   capsurface baseline <manifests-dir> [--out capsurface.lock.json]
   capsurface check <manifests-dir> --baseline capsurface.lock.json [--fail-on-new] [--report-only] [--json]
   capsurface review <manifests-dir> --baseline <file> [--json | --format markdown|json|sarif] [--lockfile <package-lock.json>] [--project-root <dir>] [--out <file>] [--fail-on-new] [--report-only]
   capsurface approve <manifests-dir> --baseline <file> --id <review-id> --reason <text> [--expires <UTC-timestamp>]
+  capsurface explain --report <review.json> --id <review-id> [--json] [--out <file>]
   capsurface diff <baseline-manifest.json> <current-manifest.json>
   capsurface allowlist <manifests-dir> [--format npm|pnpm|json] [--names] [--out <file>]
 `);

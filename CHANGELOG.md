@@ -5,6 +5,42 @@ Notable user-facing changes are recorded here using
 
 ## [Unreleased]
 
+### Added
+
+- GitLab integration for detached, same-project merge request pipelines, with
+  target/proposed baseline separation, retained artifacts and an optional
+  persistent MR note. Includes a pipeline example and token setup guidance.
+- `explain --report review.json --id <review-id>` retrieves a single saved
+  review entry as JSON, preserving source evidence, provenance and audit
+  details. It explicitly reports that freshness has not been checked and
+  does not change approvals or gate results.
+- Pre-install registry-tarball scans from pnpm v9 lockfiles, preserving aliases,
+  workspace references and separate peer contexts. Requires optional yaml 2.9.1;
+  local workspace source and patched/Git dependencies are not supported. Uses
+  a separate scan origin and changes the engine fingerprint.
+- Before/after source evidence in dependency reviews, with separate evidence
+  for ambiguous predecessors and explicit limits when an indicator was not
+  detected. Rescan both snapshots with the updated engine before approval.
+- An audit of all current installations in JSON, Markdown and SARIF reviews,
+  including unchanged packages and the status, reason and expiry of matching
+  baseline approvals. Audit information does not change gate decisions.
+- Opt-in persistent GitHub Actions PR comments through `comment-pr` and
+  `comment-key`. Same-repository PRs reuse a bot comment; unchanged reports
+  produce no edit. Comment failures preserve the job summary and gate result.
+
+### Fixed
+
+- Tarball scans accept node-tar timestamp fields and a single named archive
+  root, fixing scans of packages such as `@types/babel__core@7.20.5`. Mixed
+  roots, traversal, links and identity mismatches remain rejected. This changes
+  the engine fingerprint; rescan both comparison inputs.
+
+- Deep scans run parsing and AST analysis in a separate process with a five-second
+  timeout per analysis. Timeouts and worker failures mark coverage incomplete
+  instead of hanging the scanner or approving a partial result. This adds process
+  startup overhead and changes the engine fingerprint; existing baselines require
+  review. No total scan deadline is imposed.
+
 ## [0.1.0] - 2026-09-22
 
 First public release.

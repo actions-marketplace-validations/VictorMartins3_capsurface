@@ -56,7 +56,7 @@ test('packed CLI reviews a real npm upgrade against the committed baseline', { t
   const installed = path.dirname(path.dirname(cli));
   const requiredDocs = ['README.md', 'LICENSE', 'CHANGELOG.md', 'CONTRIBUTING.md',
     'SECURITY.md', 'docs/REVIEW.md', 'docs/VERIFICATION.md', 'docs/RELEASING.md',
-    'action.yml', 'examples/workflows/capsurface.yml'];
+    'action.yml', 'examples/workflows/capsurface.yml', 'docs/GITLAB.md', 'examples/workflows/gitlab-ci.yml'];
   for (const file of requiredDocs) {
     assert.ok(fs.existsSync(path.join(installed, file)), `packed package must include ${file}`);
   }
@@ -77,6 +77,15 @@ test('packed CLI reviews a real npm upgrade against the committed baseline', { t
     require('../lib/rules-version').RULES_VERSION, 'packing must preserve the engine fingerprint');
   assert.equal(fs.existsSync(path.join(tool, 'node_modules', 'acorn')), false,
     'the default installation must not require optional parsers');
+  assert.equal(fs.existsSync(path.join(tool, 'node_modules', 'yaml')), false,
+    'the default installation must not require the pnpm parser');
+  const yamlLock = path.join(tmp, 'pnpm-lock.yaml');
+  fs.writeFileSync(yamlLock, "lockfileVersion: '9.0'\nimporters:\n  .: {}\n");
+  const missingYaml = spawnSync(process.execPath, [cli, 'scan-lock', yamlLock,
+    '--tarballs', path.join(tmp, 'unused-map.json'), '--out', path.join(tmp, 'pnpm-output')],
+  { cwd: tmp, encoding: 'utf8', env });
+  assert.equal(missingYaml.status, 2);
+  assert.match(missingYaml.stderr, /Install yaml@2\.9\.1 alongside capsurface/);
   const project = writePackage(tmp, 'project', { name: 'integration-project', version: '1.0.0', private: true });
   const scan = (...args) => run(process.execPath, [cli, ...args], project);
   const gate = (args, status) => run(process.execPath, [cli, ...args], project, status);
@@ -122,10 +131,39 @@ test('packed CLI reviews a real npm upgrade against the committed baseline', { t
   assert.equal(changed.provenance.status, 'resolved');
   assert.deepEqual(changed.provenance.chain.map((p) => p.name), ['integration-project', 'integration-dep']);
   assert.ok(changed.evidence.some((e) => e.file === 'index.js'));
+  fs.writeFileSync(path.join(project, 'saved-review.json'), JSON.stringify(before));
+  const explained = JSON.parse(scan('explain', '--report', 'saved-review.json', '--id', changed.id, '--json'));
+  assert.deepEqual(explained.entry, changed, 'the packed CLI retains provenance and all source evidence');
+  assert.equal(explained.source.freshness, 'not-checked');
+  assert.equal(changed.baselineEvidence.length, 1);
+  assert.equal(changed.baselineEvidence[0].version, '1.0.0');
+  assert.equal(changed.baselineEvidence[0].analysisIncomplete, false);
+  assert.ok(!changed.baselineEvidence[0].evidence.some((e) => e.category === 'exec'),
+    'the old archive has no detected child_process indicator');
   scan('review', 'manifests', '--baseline', target, '--fail-on-new', '--report-only', '--out', 'review.md');
   assert.match(fs.readFileSync(path.join(project, 'review.md'), 'utf8'), /Review ID:/);
   const check = ['check', 'manifests', '--baseline', 'capsurface.lock.json', '--fail-on-new'];
   gate(check, 1);
+  function gitlab(name, expected, overrides = {}) {
+    const output = path.join(project, '.capsurface', name);
+    const result = spawnSync(process.execPath, [path.join(installed, 'bin/gitlab-review.js')], {
+      cwd: project, encoding: 'utf8', env: { ...env, CI_PROJECT_DIR: project,
+        CI_PIPELINE_SOURCE: 'merge_request_event', CI_MERGE_REQUEST_EVENT_TYPE: 'detached',
+        CI_PROJECT_ID: '1', CI_MERGE_REQUEST_SOURCE_PROJECT_ID: '1', CI_MERGE_REQUEST_TARGET_PROJECT_ID: '1',
+        CI_MERGE_REQUEST_IID: '2', CI_PIPELINE_ID: '3', CI_JOB_ID: '4', CI_COMMIT_SHA: baseSha,
+        CI_MERGE_REQUEST_TARGET_BRANCH_NAME: 'main', CAPSURFACE_PROJECT: project,
+        CAPSURFACE_BASE_REF: baseSha, CAPSURFACE_OUTPUT: output, CAPSURFACE_DEEP: 'false',
+        CAPSURFACE_FAIL_ON_NEW: 'true', CAPSURFACE_REPORT_ONLY: 'false', ...overrides },
+    });
+    assert.equal(result.status, expected, result.stderr);
+    return output;
+  }
+  const blockedGitlab = gitlab('gitlab-blocked', 1);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(blockedGitlab, 'status.json'))).gate, true);
+  assert.equal(gitlab('gitlab-report-only', 0, { CAPSURFACE_REPORT_ONLY: 'true' }).length > 0, true);
+  const missingGitlab = gitlab('gitlab-missing', 2, { CAPSURFACE_BASELINE: 'missing.json' });
+  assert.equal(JSON.parse(fs.readFileSync(path.join(missingGitlab, 'status.json'))).complete, false);
+  gitlab('gitlab-fork', 2, { CI_MERGE_REQUEST_SOURCE_PROJECT_ID: '9' });
   scan('approve', 'manifests', '--baseline', 'capsurface.lock.json', '--id', changed.id,
     '--reason', 'Reviewed the child process integration');
   gate(check, 1); // Approving the upgrade cannot approve the added package.
@@ -133,6 +171,26 @@ test('packed CLI reviews a real npm upgrade against the committed baseline', { t
   scan('approve', 'manifests', '--baseline', 'capsurface.lock.json', '--id', added.id,
     '--reason', 'Reviewed the additional HTTP client');
   gate(check, 0);
+  const approvedGitlab = gitlab('gitlab-approved', 0);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(approvedGitlab, 'status.json'))).gate, false);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(approvedGitlab, 'review.json'))).wouldFail, true,
+    'GitLab proposed approvals must not hide the target-branch comparison');
+  assert.ok(fs.existsSync(path.join(approvedGitlab, 'review.md')));
+  assert.ok(fs.existsSync(path.join(approvedGitlab, 'review.sarif')));
+  assert.equal(JSON.parse(fs.readFileSync(path.join(approvedGitlab, 'manifests/.capsurface-snapshot'))).complete, true);
+  gitlab('gitlab-approved', 2); // Never retain stale artifacts from a reused directory.
+  const approvedArgs = ['review', 'manifests', '--baseline', 'capsurface.lock.json'];
+  const approved = JSON.parse(gate([...approvedArgs, '--json'], 0));
+  assert.equal(approved.entries.length, 0);
+  assert.equal(approved.audit.counts.approved, 2);
+  const approval = approved.audit.installations.find((item) => item.name === 'integration-dep').approval;
+  assert.equal(approval.status, 'applied');
+  assert.equal(approval.reason, 'Reviewed the child process integration',
+    'the installed CLI must join the baseline approval history');
+  const approvedSarif = JSON.parse(gate([...approvedArgs, '--format', 'sarif'], 0));
+  assert.equal(approvedSarif.runs[0].results.length, 0);
+  assert.deepEqual(approvedSarif.runs[0].properties.audit, approved.audit,
+    'passing SARIF reviews must retain approval information');
   const after = JSON.parse(gate(reviewArgs, 1));
   assert.deepEqual(after, before, 'proposed approvals must not hide changes from the target-branch review');
   const actionOutput = path.join(tmp, 'action-output');
@@ -165,5 +223,10 @@ test('packed CLI reviews a real npm upgrade against the committed baseline', { t
   assert.equal(JSON.parse(fs.readFileSync(inventory)).complete, true);
   fs.writeFileSync(inventory, JSON.stringify({ schemaVersion: 1, complete: false }));
   gate([...check, '--report-only'], 2);
+  fs.writeFileSync(path.join(project, 'node_modules', 'integration-dep', 'package.json'), '{');
+  const incompleteGitlab = gitlab('gitlab-incomplete', 2, { CAPSURFACE_REPORT_ONLY: 'true' });
+  const incompleteStatus = JSON.parse(fs.readFileSync(path.join(incompleteGitlab, 'status.json')));
+  assert.ok(!incompleteStatus.complete || incompleteStatus.incomplete,
+    'GitLab report-only cannot turn incomplete analysis into a successful review');
   assert.equal(fs.existsSync(marker), false, 'neither lifecycle hooks nor the shadow CLI may execute');
 });

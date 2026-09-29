@@ -32,13 +32,16 @@ Where to change what:
 | Change what fails the build vs. what is only reported | `lib/diff.js` |
 | Match an installation to its approved predecessor | `lib/comparison.js` |
 | Explain changes or apply a selective approval | `lib/review.js`, `lib/approval.js` |
+| Inspect an entry in a saved review | `lib/explain.js` |
 | Collect and explain file-level capability relationships | `lib/source-context.js`, `lib/scanner.js` |
 | Explain potential import paths from installation scripts | `lib/install-context.js`, `lib/ast-imports.js` |
 | Hash installed content or enforce approval expiry | `lib/content-integrity.js`, `lib/approval-policy.js` |
 | Explain npm dependency origins | `lib/provenance.js` |
 | Export review results to SARIF | `lib/sarif.js` |
 | Run the GitHub review Action | `action.yml`, `bin/action-review.js` |
+| Run GitLab MR reviews and publish notes | `bin/gitlab-review.js`, `bin/gitlab-comment.js`, `lib/gitlab-comment.js` |
 | Scan lockfile-resolved local archives | `lib/lockfile-scan.js`, `lib/tarball.js` |
+| Read pnpm v9 graphs and isolate YAML parsing | `lib/pnpm-lock.js`, `lib/yaml-worker.js` |
 | Read and publish scan inventories | `lib/snapshot.js` |
 | Change how packages are found on disk | `lib/discovery.js` |
 | Change CLI flags, output, exit codes | `bin/capsurface.js` |
@@ -69,6 +72,16 @@ Two decisions shape everything:
 No install step. The default scanner has zero dependencies. Experimental AST analysis
 uses optional, exact-version Acorn and acorn-typescript peers; no parser is
 loaded in normal scans.
+
+Pre-install pnpm v9 scans use optional `yaml@2.9.1`. To test all optional modes:
+
+```bash
+npm install --no-save --package-lock=false --ignore-scripts --include=peer acorn@8.15.0 acorn-typescript@1.4.13 yaml@2.9.1
+npm run test:deep
+npm run test:pnpm
+```
+
+The pnpm adapter and YAML worker are also included in the engine fingerprint.
 
 ```bash
 git clone <this repo>
